@@ -1,0 +1,313 @@
+name: Build llama.cpp with CUDA
+
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: 'CUDA architecture (e.g., 75 for T4, 89 for RTX 4090, auto for detection)'
+        required: false
+        default: 'auto'
+      enable_nccl:
+        description: 'Enable NCCL for multi-GPU support'
+        required: false
+        default: 'true'
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-llamacpp-cuda.yml'
+
+env:
+  REPO_DIR: llama.cpp
+  BUILD_DIR: llama.cpp/build
+  STAGE_DIR: llama_stage
+  TARGETS: llama-cli llama-server llama-mtmd-cli llama-gguf-hash
+
+jobs:
+  build-cuda:
+    runs-on: ubuntu-22.04  # Standard GitHub runner (no GPU needed for compilation)
+    
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.0'  # Latest stable CUDA version
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cuda-libraries-dev"]'
+          linux-local-args: '["--toolkit"]'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            cmake \
+            build-essential \
+            libcurl4-openssl-dev \
+            wget \
+            git
+
+      - name: Install NCCL (optional, for multi-GPU)
+        if: ${{ inputs.enable_nccl == 'true' || inputs.enable_nccl == '' }}
+        run: |
+          sudo apt-get install -y libnccl-dev || echo "NCCL not available, continuing without it"
+
+      - name: Clone llama.cpp
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp "$REPO_DIR"
+          cd "$REPO_DIR"
+          echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "📌 Commit: $(git rev-parse --short HEAD)"
+
+      - name: Detect CUDA architecture
+        id: cuda-arch
+        run: |
+          ARCH_INPUT="${{ inputs.cuda_arch }}"
+          
+          # Try to detect GPU if 'auto' or not specified
+          if [ "$ARCH_INPUT" = "auto" ] || [ -z "$ARCH_INPUT" ]; then
+            if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+              echo "🔍 Detecting CUDA architecture from GPU..."
+              nvidia-smi --query-gpu=compute_cap,name --format=csv,noheader
+              
+              # Get compute capability and remove dot: 7.5 → 75
+              COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')
+              echo "CUDA_ARCH=sm_$COMPUTE_CAP" >> $GITHUB_ENV
+              echo "CUDA_ARCH_NUM=$COMPUTE_CAP" >> $GITHUB_ENV
+              
+              GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+              GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)
+              echo "GPU_COUNT=$GPU_COUNT" >> $GITHUB_ENV
+              echo "GPU_NAME=$GPU_NAME" >> $GITHUB_ENV
+              
+              echo "✅ Detected: ${GPU_COUNT}x $GPU_NAME (sm_$COMPUTE_CAP)"
+            else
+              echo "ℹ️  No GPU detected - building for multiple CUDA architectures"
+              echo "   This is normal for GitHub hosted runners"
+              echo ""
+              echo "📦 Building for common GPUs:"
+              echo "   • sm_75 - Tesla T4, Quadro RTX 4000/5000"
+              echo "   • sm_80 - A100, A30"  
+              echo "   • sm_86 - RTX 3060/3070/3080/3090, A40"
+              echo "   • sm_89 - RTX 4060/4070/4080/4090, L4, L40"
+              echo "   • sm_90 - H100, H200"
+              
+              # Build for multiple architectures (binaries will work on any of these GPUs)
+              echo "CUDA_ARCH_NUM=75;80;86;89;90" >> $GITHUB_ENV
+              echo "CUDA_ARCH=multi-arch" >> $GITHUB_ENV
+              echo "GPU_COUNT=N/A (multi-arch build)" >> $GITHUB_ENV
+              echo "GPU_NAME=sm_75;80;86;89;90" >> $GITHUB_ENV
+            fi
+          else
+            # Use user-provided architecture
+            echo "CUDA_ARCH=sm_$ARCH_INPUT" >> $GITHUB_ENV
+            echo "CUDA_ARCH_NUM=$ARCH_INPUT" >> $GITHUB_ENV
+            echo "GPU_COUNT=Manual" >> $GITHUB_ENV
+            echo "GPU_NAME=User-specified sm_$ARCH_INPUT" >> $GITHUB_ENV
+            echo "✅ Using specified architecture: sm_$ARCH_INPUT"
+          fi
+
+      - name: Find CUDA libraries
+        run: |
+          echo "🔍 Locating CUDA toolkit libraries..."
+          
+          # On GitHub runners, we only have CUDA toolkit (no driver)
+          # Find the stub library for linking
+          CUDA_STUBS=$(find /usr/local/cuda* -path "*/lib64/stubs" -type d 2>/dev/null | head -n1 || echo "")
+          
+          if [ -z "$CUDA_STUBS" ]; then
+            # Try alternate locations
+            CUDA_STUBS=$(find /usr/lib* /usr/local/lib* -path "*/stubs" -name "libcuda.so" 2>/dev/null | head -n1 | xargs dirname || echo "")
+          fi
+          
+          if [ -n "$CUDA_STUBS" ]; then
+            echo "CUDA_STUBS=$CUDA_STUBS" >> $GITHUB_ENV
+            echo "✅ Found CUDA stub libraries: $CUDA_STUBS"
+            ls -lh "$CUDA_STUBS"/libcuda* 2>/dev/null || true
+          else
+            echo "ℹ️  CUDA stub libraries not needed for this build configuration"
+            echo "CUDA_STUBS=" >> $GITHUB_ENV
+          fi
+
+      - name: Configure CMake
+        run: |
+          mkdir -p "$BUILD_DIR"
+          
+          # Determine NCCL flag
+          NCCL_FLAG="-DGGML_NCCL=OFF"
+          if [ "${{ inputs.enable_nccl }}" = "true" ] && dpkg -l | grep -q libnccl; then
+            NCCL_FLAG="-DGGML_NCCL=ON"
+            echo "✅ NCCL enabled for multi-GPU support"
+          fi
+          
+          # Build CMake arguments
+          CMAKE_ARGS=(
+            -S "$REPO_DIR"
+            -B "$BUILD_DIR"
+            -DGGML_CUDA=ON
+            $NCCL_FLAG
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_NUM}"
+            -DCMAKE_BUILD_TYPE=Release
+            -DLLAMA_CURL=ON
+            -DGGML_NATIVE=OFF
+            -DGGML_CUDA_NO_VMM=ON
+            -DBUILD_SHARED_LIBS=OFF
+          )
+          
+          # Add linker flags if CUDA stubs found
+          if [ -n "$CUDA_STUBS" ]; then
+            CMAKE_ARGS+=(
+              -DCMAKE_EXE_LINKER_FLAGS="-L${CUDA_STUBS}"
+              -DCMAKE_SHARED_LINKER_FLAGS="-L${CUDA_STUBS}"
+            )
+          fi
+          
+          echo "🔧 CMake configuration:"
+          echo "  CUDA Architecture: ${CUDA_ARCH_NUM}"
+          echo "  NCCL: $NCCL_FLAG"
+          echo "  Build Type: Release"
+          
+          cmake "${CMAKE_ARGS[@]}"
+
+      - name: Build llama.cpp
+        run: |
+          JOBS=$(nproc)
+          echo "🔨 Building with $JOBS parallel jobs..."
+          echo "📦 Targets: $TARGETS"
+          
+          cmake --build "$BUILD_DIR" \
+            --config Release \
+            -j "$JOBS" \
+            --target $TARGETS
+          
+          echo "✅ Build finished!"
+
+      - name: Stage binaries
+        run: |
+          mkdir -p "$STAGE_DIR"
+          
+          # Copy binaries
+          echo "📦 Staging binaries:"
+          for target in $TARGETS; do
+            # Try different possible locations
+            for path in "$BUILD_DIR/bin/$target" "$BUILD_DIR/$target"; do
+              if [ -f "$path" ]; then
+                cp "$path" "$STAGE_DIR/"
+                SIZE=$(du -h "$path" | cut -f1)
+                echo "  ✓ $target ($SIZE)"
+                break
+              fi
+            done
+          done
+          
+          # Copy shared libraries if any
+          find "$BUILD_DIR" -name "*.so*" -type f -exec cp {} "$STAGE_DIR/" \; 2>/dev/null || true
+          
+          # Create build info
+          CUDA_VERSION=$(nvcc --version | grep "release" | sed 's/.*release //' | sed 's/,.*//')
+          cat > "$STAGE_DIR/BUILD_INFO.txt" << EOF
+          llama.cpp commit : $GIT_HASH
+          CUDA arch        : $CUDA_ARCH
+          CUDA version     : $CUDA_VERSION
+          GPU              : $GPU_COUNT x $GPU_NAME
+          Targets          : $TARGETS
+          NCCL             : ${{ inputs.enable_nccl == 'true' && 'enabled' || 'disabled' }}
+          Build date       : $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow run     : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          
+          echo ""
+          echo "📋 Build info:"
+          cat "$STAGE_DIR/BUILD_INFO.txt"
+          
+          echo ""
+          echo "📂 Staged files:"
+          ls -lh "$STAGE_DIR"
+
+      - name: Create tarball
+        run: |
+          TARBALL="llamacpp-cuda-${GIT_HASH}.tar.gz"
+          tar -czf "$TARBALL" -C "$STAGE_DIR" .
+          
+          echo "📦 Package created:"
+          ls -lh "$TARBALL"
+          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamacpp-cuda-binaries
+          path: |
+            ${{ env.TARBALL }}
+            ${{ env.STAGE_DIR }}/BUILD_INFO.txt
+          retention-days: 30
+
+      - name: Create release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ env.TARBALL }}
+          body: |
+            ## llama.cpp CUDA Build
+            
+            **Build Information:**
+            - Commit: `${{ env.GIT_HASH }}`
+            - CUDA Architecture: `${{ env.CUDA_ARCH }}`
+            - GPU: ${{ env.GPU_COUNT }} x ${{ env.GPU_NAME }}
+            - NCCL: ${{ inputs.enable_nccl == 'true' && 'Enabled' || 'Disabled' }}
+            
+            **Included binaries:**
+            - `llama-cli` - Main inference CLI
+            - `llama-server` - OpenAI-compatible API server
+            - `llama-mtmd-cli` - Multimodal CLI (text + images)
+            - `llama-gguf-hash` - GGUF file hash utility
+            
+            **Usage Example:**
+            ```bash
+            # Extract
+            tar -xzf llamacpp-cuda-*.tar.gz
+            
+            # Run inference
+            ./llama-cli -hf unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL \
+              --gpu-layers 99 --flash-attn -p "Hello!"
+            ```
+
+  build-cpu-fallback:
+    runs-on: ubuntu-latest
+    if: ${{ failure() }}  # Only runs if CUDA build fails
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake build-essential libcurl4-openssl-dev
+
+      - name: Clone llama.cpp
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp
+          cd llama.cpp
+          echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Build (CPU only)
+        run: |
+          mkdir -p llama.cpp/build
+          cmake -S llama.cpp -B llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CURL=ON \
+            -DGGML_NATIVE=OFF
+          
+          cmake --build llama.cpp/build --config Release -j$(nproc)
+
+      - name: Upload CPU binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamacpp-cpu-binaries
+          path: llama.cpp/build/bin/*
+          retention-days: 7
