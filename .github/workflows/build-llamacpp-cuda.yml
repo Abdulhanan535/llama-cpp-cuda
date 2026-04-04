@@ -1,14 +1,14 @@
-name: Build llama.cpp with CUDA
+name: Build llama.cpp CUDA (Auto Release)
 
 on:
   workflow_dispatch:
     inputs:
       cuda_arch:
-        description: 'CUDA architecture (e.g., 75, 86, 89 or auto)'
+        description: 'CUDA architecture (75, 86, 89 or auto)'
         required: false
         default: 'auto'
       enable_nccl:
-        description: 'Enable NCCL for multi-GPU support'
+        description: 'Enable NCCL'
         required: false
         default: 'true'
         type: boolean
@@ -23,33 +23,44 @@ env:
   TARGETS: llama-cli llama-server llama-gguf-hash
 
 jobs:
-  build-cuda:
+  build:
     runs-on: ubuntu-22.04
     permissions:
-      contents: write   # ✅ REQUIRED for release upload
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
 
-      # ✅ Stable CUDA
+      # 🔥 FIX: remove broken duplicate CUDA repos
+      - name: Clean CUDA repos
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/cuda*.list || true
+          sudo rm -f /etc/apt/sources.list.d/*nvidia*.list || true
+
+      # ✅ Install CUDA (stable)
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.16
         with:
           cuda: '12.1.0'
           method: 'network'
-          sub-packages: '["nvcc","cudart","cuda-libraries-dev"]'
+          # ❌ NO sub-packages (this caused your error)
 
+      # ✅ Ensure CUDA works
       - name: Setup CUDA env
         run: |
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           nvcc --version
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            cmake build-essential libcurl4-openssl-dev git wget
+            cmake \
+            build-essential \
+            libcurl4-openssl-dev \
+            git \
+            wget
 
       - name: Install NCCL
         if: ${{ inputs.enable_nccl == 'true' }}
@@ -61,7 +72,7 @@ jobs:
           cd "$REPO_DIR"
           echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-      # ✅ ARCH FIX
+      # ✅ Stable arch handling
       - name: Set CUDA arch
         run: |
           if [ "${{ inputs.cuda_arch }}" = "auto" ] || [ -z "${{ inputs.cuda_arch }}" ]; then
@@ -72,7 +83,7 @@ jobs:
             echo "CUDA_ARCH=sm_${{ inputs.cuda_arch }}" >> $GITHUB_ENV
           fi
 
-      # ✅ CLEAN BUILD
+      # ✅ Clean CMake (no broken flags)
       - name: Configure
         run: |
           mkdir -p "$BUILD_DIR"
@@ -97,7 +108,7 @@ jobs:
             -j$(nproc) \
             --target $TARGETS
 
-      - name: Stage
+      - name: Stage binaries
         run: |
           mkdir -p "$STAGE_DIR"
 
@@ -105,6 +116,7 @@ jobs:
             for p in "$BUILD_DIR/bin/$t" "$BUILD_DIR/$t"; do
               if [ -f "$p" ]; then
                 cp "$p" "$STAGE_DIR/"
+                echo "Added $t"
                 break
               fi
             done
@@ -128,12 +140,11 @@ jobs:
           name: llamacpp-cuda
           path: ${{ env.TARBALL }}
 
-      # 🚀 INSTALL GH CLI
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get install -y gh
+      # 🚀 Install GitHub CLI
+      - name: Install gh
+        run: sudo apt-get install -y gh
 
-      # 🚀 CREATE / UPDATE ROLLING RELEASE
+      # 🚀 Auto rolling release (like Koboldcpp)
       - name: Push to rolling release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -143,5 +154,4 @@ jobs:
             --notes "Latest auto-built CUDA binaries" \
             || echo "Release exists"
 
-          gh release upload rolling "$TARBALL" \
-            --clobber
+          gh release upload rolling "$TARBALL" --clobber
