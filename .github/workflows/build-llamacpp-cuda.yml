@@ -68,7 +68,7 @@ jobs:
 
       - name: Clone llama.cpp
         run: |
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp "$REPO_DIR"
+          git clone --depth 1 https://github.com/PrismML-Eng/llama.cpp "$REPO_DIR"
           cd "$REPO_DIR"
           echo "GIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
